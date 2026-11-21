@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	agentruntime "gpuworks.ai/gpuworks/internal/agent/runtime"
 )
 
 func TestRuntimeMountManagerPreparesTraversableReadOnlyAssetPath(t *testing.T) {
@@ -125,5 +127,88 @@ func TestRuntimeMountManagerPreStartPublicationIsAtomicAndIdempotent(t *testing.
 	}
 	if secondInfo.Mode().Perm() != 0o444 {
 		t.Fatalf("wrapper mode=%o, want 0444", secondInfo.Mode().Perm())
+	}
+}
+
+// A root agent on a local filesystem can traverse and read through
+// CAP_DAC_OVERRIDE where the mode bits deny it: a preflight failed on a
+// 0711 state directory owned by the sudo caller's uid while the agent ran
+// as root. The preflight must ask the kernel when the mount owner is the
+// calling identity itself, and must keep the mode-bit verdict when the
+// owner is someone else (the kernel cannot speak for a switched identity).
+// Without capabilities the kernel answer matches the bits, which pins both
+// directions.
+func TestRuntimeMountPreflightFallsBackToKernelAccess(t *testing.T) {
+	state := t.TempDir()
+	manager := &RuntimeMountManager{stateDir: state, root: state, legacy: true}
+	owner := agentruntime.MountOwner{UID: os.Geteuid(), GID: os.Getegid()}
+
+	if os.Geteuid() == 0 {
+		if err := os.Chown(state, 1000, 1000); err != nil {
+			t.Skipf("this user namespace does not map uid 1000: %v", err)
+		}
+		if err := os.Chmod(state, 0o711); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.ensureRoot(owner); err != nil {
+			t.Fatalf("root agent must pass preflight the kernel allows despite mode bits: %v", err)
+		}
+		info, err := os.Stat(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o711 {
+			t.Fatalf("preflight fell back to a chmod: mode=%o, want 0711 kept", info.Mode().Perm())
+		}
+		// The same false denial is reachable on an ancestor: a 0700
+		// directory owned by another uid must not block a root agent's
+		// ancestor walk, and a foreign owner must keep the denial. The
+		// 0700 mode is what makes this pin the kernel probe: the mode
+		// bits deny every class, so only the probe can pass the walk.
+		nested := filepath.Join(state, "nested")
+		if err := os.Mkdir(nested, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(nested, 1000, 1000); err != nil {
+			t.Skipf("this user namespace does not map uid 1000: %v", err)
+		}
+		if err := agentruntime.CheckAncestorTraversal(nested, owner); err != nil {
+			t.Fatalf("root agent must traverse a 0700 foreign-owned ancestor: %v", err)
+		}
+		if err := agentruntime.CheckAncestorTraversal(nested, agentruntime.MountOwner{UID: 4242, GID: 4242}); err == nil {
+			t.Fatal("a foreign owner must keep the mode-bit denial on the ancestor")
+		}
+		return
+	}
+
+	denied := filepath.Join(state, "denied")
+	if err := os.Mkdir(denied, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.preflight(denied, owner, true); err == nil {
+		t.Fatal("preflight must fail when the kernel also denies search+read on 0300")
+	}
+	if err := os.Chmod(denied, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.preflight(denied, owner, true); err != nil {
+		t.Fatalf("preflight must pass when the mode bits allow: %v", err)
+	}
+	if err := os.Chmod(denied, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	file := filepath.Join(denied, "asset")
+	if err := os.WriteFile(file, []byte("asset"), 0o200); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.preflight(file, owner, false); err == nil {
+		t.Fatal("preflight must fail when the kernel also denies read on a 0200 file")
+	}
+	if err := os.Chmod(file, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.preflight(file, owner, false); err != nil {
+		t.Fatalf("preflight must pass when the file bits allow: %v", err)
 	}
 }

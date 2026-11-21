@@ -106,6 +106,10 @@ func (m *RuntimeMountManager) mountOwner() (agentruntime.MountOwner, error) {
 }
 
 func createDirectoryAsOwner(owner agentruntime.MountOwner, name string, mode os.FileMode) error {
+	// The uid match is deliberate where a full identity match is not: the
+	// mkdir runs as this process and ensureManagedDirectory chowns the group
+	// afterwards, so a gid-only mismatch repairs itself and must not demand
+	// a username the configuration does not carry.
 	if owner.UID == os.Geteuid() {
 		if err := os.Mkdir(name, mode); err != nil && !errors.Is(err, os.ErrExist) {
 			return err
@@ -126,6 +130,18 @@ func createDirectoryAsOwner(owner agentruntime.MountOwner, name string, mode os.
 }
 
 func checkAccessAsOwner(owner agentruntime.MountOwner, name string, directory bool) error {
+	// The uid alone decides here, on purpose -- a different rule from
+	// agentruntime.isCallingIdentity (uid and gid), and the two must not
+	// be unified blindly. This check answers "can this process itself
+	// reach the path": when the uid matches, this process performs the
+	// access and its kernel view -- capabilities included -- is the
+	// answer; a gid-only mismatch does not change what THIS process can
+	// reach. OwnerCanAccess answers a different question, "can the OWNER
+	// identity reach the path", where a gid-only mismatch means the
+	// process's group view is not the owner's and the mode bits must
+	// speak instead. Flipping this gate to uid+gid would turn a working
+	// gid-mismatch-without-username configuration (accepted by mountOwner,
+	// repaired by the mkdir-then-chown flow) into a hard error.
 	if owner.UID == os.Geteuid() {
 		return nil
 	}
@@ -459,7 +475,7 @@ func (m *RuntimeMountManager) preflight(name string, owner agentruntime.MountOwn
 			if isTarget {
 				need = 0o5
 			}
-			if !agentruntime.HasPermission(info, owner, need) {
+			if !agentruntime.OwnerCanAccess(current, info, owner, need) {
 				return permissionError(current, info, owner, "traverse/read")
 			}
 			if m.accessAsOwner != nil {
@@ -472,7 +488,7 @@ func (m *RuntimeMountManager) preflight(name string, owner agentruntime.MountOwn
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("runtime mount preflight target %s is not a regular file", current)
 		}
-		if !agentruntime.HasPermission(info, owner, 0o4) {
+		if !agentruntime.OwnerCanAccess(current, info, owner, 0o4) {
 			return permissionError(current, info, owner, "read")
 		}
 		if m.accessAsOwner != nil {
